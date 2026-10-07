@@ -1,7 +1,7 @@
+use crate::errors::AegisError;
+use crate::state::{VaultConfig, VAULT_CONFIG_SEED};
 use anchor_lang::prelude::*;
 use anchor_spl::token::Mint;
-use crate::state::{VaultConfig, VAULT_CONFIG_SEED};
-use crate::errors::AegisError;
 
 #[derive(Accounts)]
 pub struct EmergencyPause<'info> {
@@ -11,7 +11,7 @@ pub struct EmergencyPause<'info> {
 
     #[account(
         mut,
-        seeds = [VAULT_CONFIG_SEED, token_mint.key().as_ref()],
+        seeds = [VAULT_CONFIG_SEED, vault_config.admin.as_ref(), token_mint.key().as_ref()],
         bump = vault_config.bump,
         has_one = token_mint @ AegisError::InvalidMint
     )]
@@ -28,7 +28,10 @@ pub fn handle_pause(ctx: Context<EmergencyPause>) -> Result<()> {
     );
 
     vault_config.is_paused = true;
-    msg!("EMERGENCY: Aegis Vault has been PAUSED by {}", authority_key);
+    msg!(
+        "EMERGENCY: Aegis Vault has been PAUSED by {}",
+        authority_key
+    );
     Ok(())
 }
 
@@ -55,7 +58,7 @@ pub struct UpdateVaultParams<'info> {
 
     #[account(
         mut,
-        seeds = [VAULT_CONFIG_SEED, token_mint.key().as_ref()],
+        seeds = [VAULT_CONFIG_SEED, vault_config.admin.as_ref(), token_mint.key().as_ref()],
         bump = vault_config.bump,
         has_one = admin @ AegisError::UnauthorizedSigner,
         has_one = token_mint @ AegisError::InvalidMint
@@ -78,6 +81,10 @@ pub fn handle_update_params(
 
     if let Some(limit) = new_epoch_limit {
         require!(limit > 0, AegisError::ZeroAmountInvalid);
+        require!(
+            limit >= config.max_epoch_withdrawal_limit || config.total_active_escrow_amount == 0,
+            AegisError::ActiveEscrowsPreventLimitDecrease
+        );
         config.max_epoch_withdrawal_limit = limit;
         msg!("Max epoch withdrawal limit updated to {}", limit);
     }

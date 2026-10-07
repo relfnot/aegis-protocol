@@ -6,7 +6,7 @@ pub mod state;
 
 use instructions::*;
 
-declare_id!("AegisVau1t1111111111111111111111111111111111");
+declare_id!("Fg6PaFpoGXkYsidMpWxTWqkZqXmJbYyHhP7FZxQzLhQZ");
 
 #[program]
 pub mod aegis_vault {
@@ -18,7 +18,7 @@ pub mod aegis_vault {
         max_epoch_withdrawal_limit: u64,
         epoch_duration_seconds: i64,
     ) -> Result<()> {
-        instructions::initialize_vault::handler(
+        instructions::initialize_vault::process_initialize_vault(
             ctx,
             max_epoch_withdrawal_limit,
             epoch_duration_seconds,
@@ -33,7 +33,7 @@ pub mod aegis_vault {
         release_timestamp: i64,
         expiry_timestamp: i64,
     ) -> Result<()> {
-        instructions::create_escrow::handler(
+        instructions::create_escrow::process_create_escrow(
             ctx,
             escrow_id,
             amount,
@@ -44,15 +44,15 @@ pub mod aegis_vault {
 
     /// Release funds from escrow to recipient subject to rate limits and timelock checks
     pub fn release_escrow(ctx: Context<ReleaseEscrow>) -> Result<()> {
-        instructions::release_escrow::handler(ctx)
+        instructions::release_escrow::process_release_escrow(ctx)
     }
 
     /// Cancel expired escrow and return locked tokens to sender
     pub fn cancel_escrow(ctx: Context<CancelEscrow>) -> Result<()> {
-        instructions::cancel_escrow::handler(ctx)
+        instructions::cancel_escrow::process_cancel_escrow(ctx)
     }
 
-    /// Emergency Circuit Breaker: Pause all state mutations (Admin or Guardian)
+    /// Emergency Circuit Breaker: Pause deposits and settlements (Admin or Guardian)
     pub fn emergency_pause(ctx: Context<EmergencyPause>) -> Result<()> {
         instructions::emergency_actions::handle_pause(ctx)
     }

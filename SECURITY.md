@@ -1,62 +1,61 @@
-# 🛡️ Aegis Protocol — Security Architecture & Threat Model
+# Aegis security model
 
-> **Targeted Pre-Audit Review Document for Adevar Labs (SEAL-Certified Auditor)**
+Status: unaudited prototype. This document describes intended and implemented controls, not a certification or formal proof. Read VALIDATION.md for checks actually performed.
 
----
+## Assets and account binding
 
-## 1. Executive Security Summary
+Vaults hold classic SPL tokens on behalf of active escrows. Vault configuration is derived from admin and mint, and records its token account. Each escrow stores its vault public key and includes that key in its seeds. Both settlement instructions verify the stored vault binding. Token account mint, authority and configured address are checked.
 
-Security in Aegis Protocol is treated as a fundamental architectural pillar rather than an afterthought. The protocol mediates high-value conditional transfers, rate-limited liquidity vaults, and automated circuit-breaker tripwires on the Solana blockchain.
+Different admins may operate independent vaults for the same mint. Clients must display and verify the chosen admin and vault address before deposit.
 
-This document formalizes our threat assumptions, invariant guarantees, and the specific attack vectors we request Adevar Labs to prioritize during the Pre-Audit review.
+## Permission and time rules
 
----
+| Operation | Who | Conditions |
+| --- | --- | --- |
+| Create | Sender | Amount positive and no greater than cap; release < expiry; expiry in future; unpaused |
+| Release | Recipient | release <= chain time < expiry; unpaused; budget available |
+| Early release | Sender or nonzero arbiter | chain time < expiry; unpaused; budget available; destination remains recipient |
+| Refund | Sender | chain time >= expiry; unpaused; budget available |
+| Early refund | Recipient or nonzero arbiter | unpaused; budget available; destination remains sender |
+| Pause | Guardian or admin | No settlement rights conferred by role |
+| Unpause | Admin | Guardian cannot resume |
+| Change parameters | Admin | Positive cap/duration; cannot lower cap with outstanding liabilities |
 
-## 2. Protocol Invariants
+System Program/default public key indicates no arbiter. Roles may overlap. An arbiter who is also sender can refund early. A sender who is also recipient but is not arbiter still waits until expiry to refund. A sender who is also recipient can release early as sender. Applications should disclose these overlaps.
 
-The protocol guarantees the following mathematical invariants across all execution paths:
+A past release timestamp is allowed for immediate claims. At expiry, release is rejected and refund is the remaining settlement path. Admin parameter changes remain allowed while paused; pause blocks deposits and fund movement, not recovery configuration.
 
-### Invariant 1: Total Liability Solvency
-$$\text{Balance}(\text{VaultTokenAccount}) \ge \text{total\_active\_escrow\_amount}$$
-* Every token deposited into an active escrow MUST be accounted for in `total_active_escrow_amount`.
-* No tokens can be released or refunded without decrementing `total_active_escrow_amount` via verified checked arithmetic.
+## Accounting properties
 
-### Invariant 2: Non-Exceedable Epoch Flow Rate
-$$\sum_{i=1}^{k} \text{withdrawal}_i \le \text{max\_epoch\_withdrawal\_limit} \quad \forall \; t \in [\text{epoch\_start}, \text{epoch\_start} + \text{epoch\_duration}]$$
-* Mitigates flash drains. If cumulative withdrawals within a sliding window hit the limit, transactions fail with `AegisError::RateLimitExceeded`.
+- Actual token balance must be at least recorded active liabilities before and after each deposit or settlement. The token account is reloaded after CPI before checking post-transfer solvency.
+- Active liabilities increase by the deposited amount and decrease once on settlement, using checked arithmetic.
+- Escrow can settle once; failed transactions must leave balances, status and counters unchanged.
+- Release and refund call the same outflow accounting method.
+- No partial settlement. Oversized escrows are rejected before transfer. Lowering limits while liabilities exist is rejected to avoid making previously accepted escrows too large to settle.
+- Direct token donations may create surplus. There is no surplus withdrawal instruction.
 
-### Invariant 3: Single Settlement Terminality
-* An `EscrowAccount` can transition to `is_released == true` OR `is_cancelled == true` exactly once. Re-entry, duplicate releases, or double-refunds are prevented by explicit state assertion and zeroing logic.
+## Window semantics and limitations
 
-### Invariant 4: Dual-Role Privileged Separation
-* `guardian`: Can invoke `emergency_pause()` immediately, but **cannot** call `emergency_unpause()`, withdraw funds, or alter protocol parameters.
-* `admin`: Required to invoke `emergency_unpause()` and modify governance parameters.
+The window resets on the first successful outflow at or after start + duration. It is not a sliding window or a Solana consensus epoch. The exact boundary allows a new budget, and two windows can permit nearly twice the cap within a short interval. Admin edits preserve existing spent amount and start but may change when the next reset happens. Refunds can wait for budget. There is no fairness queue between competing claims.
 
----
+## Trust assumptions
 
-## 3. Solana Attack Vectors & Mitigations
+Admin is trusted to configure sensible budgets and durations and recover from pause. A malicious or unavailable admin can weaken limits or prevent settlement. A compromised guardian can pause indefinitely until admin intervenes. An arbiter can choose early release or refund and is trusted for that decision; no on-chain dispute evidence is assessed. Program upgrade authority, if retained, is trusted. Token mint/freeze authorities retain the powers of the underlying token program. There is no automatic anomaly detector and no guarantee that a guardian can react before an exploit.
 
-| Attack Vector | Vulnerability Description | Aegis Protocol Mitigation |
-| :--- | :--- | :--- |
-| **Account Confusions / Fake Accounts** | Attacker passes malicious token accounts or impostor mints. | Strict Anchor `has_one = token_mint`, `has_one = vault_token_account`, and PDA derivation seed matching. |
-| **Missing Signer Checks** | Unauthenticated callers invoking privileged instructions. | Explicit `Signer<'info>` type constraints on caller keys, verified against stored public keys. |
-| **Integer Overflows / Underflows** | Overflowing counters or balances to wrap amounts. | Mandatory use of Rust's `checked_add()`, `checked_sub()`, and `overflow-checks = true` in `Cargo.toml`. |
-| **Timestamp Manipulation** | Miners or validators drifting timestamps. | Timelocks operate on macro intervals (hours/days). Short-interval reliance is strictly prohibited in economic logic. |
-| **Reentrancy via CPI** | Malicious programs exploiting nested calls during token transfers. | Checks-Effects-Interactions pattern: state updates occur prior to or atomically alongside CPI token transfers, guarded by Anchor discriminator checks. |
-| **PDA Seed Collision** | Two users colliding on the same Escrow PDA. | Deterministic seeds `[b"aegis_escrow", sender.key(), escrow_id.to_le_bytes()]` guarantee mathematical uniqueness per user. |
+Only classic SPL Token is accepted by the handlers. Token-2022 support is not claimed. No protection is promised for other protocols' assets that do not enter these vaults.
 
----
+## Review priorities
 
-## 4. Priority Areas for Adevar Labs Pre-Audit
+1. Cross-vault/cross-mint account substitution, including same-mint different-admin vaults.
+2. Release/refund shared budget, exact rollover boundaries and admin parameter changes.
+3. Role overlap, early arbiter actions, expiry exclusivity and double settlement.
+4. Actual reserve accounting, failed CPI rollback and malformed token accounts.
+5. Pause availability tradeoffs, operational key management and upgrade authority.
 
-We specifically request Adevar Labs security engineers to focus on:
-1. **Epoch Rollover Edge Cases**: Review the sliding window logic in `release_escrow.rs` when crossing epoch boundaries during rapid successive blocks.
-2. **PDA Signer Seeds & Bump Security**: Validate that the seeds passed to `token::transfer` via CPI strictly enforce canonical bumps and cannot be abused by foreign programs.
-3. **Token-2022 Transfer Hook Compatibility**: Potential interactions when integrating Token-2022 mints with custom fee-on-transfer or transfer-hook extensions.
+Rust tests cover arithmetic and exact boundaries. Integration tests exercise account constraints, CPI transfers, authorization and rejected-transaction state preservation. Passing tests are evidence, not an audit or exhaustive proof.
 
----
+## Migration and reporting
 
-## 5. Responsible Disclosure & Reporting
+This version changes both PDA derivation and EscrowAccount layout. No migration is implemented. Use a fresh test deployment; a live migration needs its own review and recovery plan.
 
-- **Contact**: `security@aegis-protocol.io`
-- **PGP Key**: Published on protocol website & keybase.
+No verified private disclosure email or PGP key has been supplied. The project owner must publish a working private contact before accepting public deposits. Do not claim an invented address or key as an existing reporting channel.

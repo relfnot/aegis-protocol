@@ -1,7 +1,7 @@
+use crate::errors::AegisError;
+use crate::state::{EscrowAccount, VaultConfig, ESCROW_SEED, VAULT_CONFIG_SEED};
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
-use crate::state::{EscrowAccount, VaultConfig, ESCROW_SEED, VAULT_CONFIG_SEED};
-use crate::errors::AegisError;
 
 #[derive(Accounts)]
 pub struct ReleaseEscrow<'info> {
@@ -20,32 +20,33 @@ pub struct ReleaseEscrow<'info> {
 
     #[account(
         mut,
-        seeds = [VAULT_CONFIG_SEED, token_mint.key().as_ref()],
+        seeds = [VAULT_CONFIG_SEED, vault_config.admin.as_ref(), token_mint.key().as_ref()],
         bump = vault_config.bump,
         has_one = token_mint @ AegisError::InvalidMint,
         has_one = vault_token_account @ AegisError::InvalidTokenAccount
     )]
     pub vault_config: Account<'info, VaultConfig>,
 
-    #[account(mut)]
+    #[account(mut, token::mint = token_mint, token::authority = vault_config)]
     pub vault_token_account: Account<'info, TokenAccount>,
 
     #[account(
         mut,
         seeds = [
             ESCROW_SEED,
+            escrow_account.vault_config.as_ref(),
             escrow_account.sender.as_ref(),
             &escrow_account.escrow_id.to_le_bytes()
         ],
         bump = escrow_account.bump,
-        has_one = recipient_token_account @ AegisError::InvalidTokenAccount
+        has_one = vault_config @ AegisError::InvalidVault
     )]
     pub escrow_account: Account<'info, EscrowAccount>,
 
     pub token_program: Program<'info, Token>,
 }
 
-pub fn handler(ctx: Context<ReleaseEscrow>) -> Result<()> {
+pub fn process_release_escrow(ctx: Context<ReleaseEscrow>) -> Result<()> {
     let clock = Clock::get()?;
     let caller_key = ctx.accounts.caller.key();
     let escrow = &ctx.accounts.escrow_account;
@@ -54,8 +55,13 @@ pub fn handler(ctx: Context<ReleaseEscrow>) -> Result<()> {
     // 1. Circuit breaker check
     require!(!vault_config.is_paused, AegisError::VaultPaused);
 
+    vault_config.assert_solvent(ctx.accounts.vault_token_account.amount)?;
+
     // 2. Settlement state check
-    require!(!escrow.is_released && !escrow.is_cancelled, AegisError::EscrowAlreadySettled);
+    require!(
+        !escrow.is_released && !escrow.is_cancelled,
+        AegisError::EscrowAlreadySettled
+    );
 
     // 3. Authorization and Timelock evaluation
     let is_sender = caller_key == escrow.sender;
@@ -75,27 +81,14 @@ pub fn handler(ctx: Context<ReleaseEscrow>) -> Result<()> {
         );
     }
 
+    require!(
+        clock.unix_timestamp < escrow.expiry_timestamp,
+        AegisError::EscrowExpired
+    );
     let release_amount = escrow.amount;
 
-    // 4. Rate-Limiting / Circuit Breaker Check per epoch
-    let elapsed = clock.unix_timestamp.saturating_sub(vault_config.current_epoch_start);
-    if elapsed >= vault_config.epoch_duration {
-        // Roll over epoch
-        vault_config.current_epoch_start = clock.unix_timestamp;
-        vault_config.current_epoch_withdrawn = 0;
-    }
-
-    let projected_withdrawal = vault_config
-        .current_epoch_withdrawn
-        .checked_add(release_amount)
-        .ok_or(AegisError::ArithmeticOverflow)?;
-
-    require!(
-        projected_withdrawal <= vault_config.max_epoch_withdrawal_limit,
-        AegisError::RateLimitExceeded
-    );
-
-    vault_config.current_epoch_withdrawn = projected_withdrawal;
+    // Every release and refund consumes the same outflow budget.
+    vault_config.record_outflow(clock.unix_timestamp, release_amount)?;
 
     // 5. Update Invariant: Deduct active escrow volume
     vault_config.total_active_escrow_amount = vault_config
@@ -107,6 +100,7 @@ pub fn handler(ctx: Context<ReleaseEscrow>) -> Result<()> {
     let mint_key = ctx.accounts.token_mint.key();
     let seeds = &[
         VAULT_CONFIG_SEED,
+        vault_config.admin.as_ref(),
         mint_key.as_ref(),
         &[vault_config.bump],
     ];
@@ -123,11 +117,17 @@ pub fn handler(ctx: Context<ReleaseEscrow>) -> Result<()> {
         signer,
     );
     token::transfer(cpi_ctx, release_amount)?;
+    ctx.accounts.vault_token_account.reload()?;
+    vault_config.assert_solvent(ctx.accounts.vault_token_account.amount)?;
 
     // 7. Update Escrow status
     let escrow_mut = &mut ctx.accounts.escrow_account;
     escrow_mut.is_released = true;
 
-    msg!("Aegis Escrow #{} successfully released: {} tokens to recipient", escrow_mut.escrow_id, release_amount);
+    msg!(
+        "Aegis Escrow #{} successfully released: {} tokens to recipient",
+        escrow_mut.escrow_id,
+        release_amount
+    );
     Ok(())
 }

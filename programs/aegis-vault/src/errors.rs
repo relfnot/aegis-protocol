@@ -8,10 +8,10 @@ pub enum AegisError {
     #[msg("Unauthorized signer: Sender does not have permission for this privileged operation.")]
     UnauthorizedSigner,
 
-    #[msg("Rate limit exceeded: Cumulative epoch withdrawal limit reached. Circuit breaker active.")]
+    #[msg("Rate limit exceeded: Shared release/refund budget exhausted for this window.")]
     RateLimitExceeded,
 
-    #[msg("Invalid timelock: Release timestamp cannot be in the past or after the expiry timestamp.")]
+    #[msg("Invalid timing: Release must precede expiry and window duration must be positive.")]
     InvalidTimelockConfiguration,
 
     #[msg("Timelock still active: Escrow release condition is not yet satisfied.")]
@@ -40,4 +40,16 @@ pub enum AegisError {
 
     #[msg("Protocol invariant violation: Inactive or unbalanced state detected.")]
     InvariantViolation,
+
+    #[msg("Escrow belongs to a different vault.")]
+    InvalidVault,
+
+    #[msg("Escrow exceeds the per-window limit; split payment into smaller escrows.")]
+    EscrowExceedsLimit,
+
+    #[msg("Cannot lower the outflow limit while active escrow liabilities exist.")]
+    ActiveEscrowsPreventLimitDecrease,
+
+    #[msg("Clock precedes the current window start.")]
+    InvalidClock,
 }

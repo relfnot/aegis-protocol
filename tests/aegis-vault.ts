@@ -1,268 +1,492 @@
 import * as anchor from "@coral-xyz/anchor";
-import { Program } from "@coral-xyz/anchor";
-import { PublicKey, Keypair, SystemProgram } from "@solana/web3.js";
+import { Keypair, PublicKey, SystemProgram } from "@solana/web3.js";
 import {
-  TOKEN_PROGRAM_ID,
   createMint,
   createAccount,
   mintTo,
   getAccount,
+  TOKEN_PROGRAM_ID,
 } from "@solana/spl-token";
 import { expect } from "chai";
 
-describe("Aegis Protocol - Security & Escrow Test Suite", () => {
+describe("Aegis escrow security", function () {
+  this.timeout(120000);
   const provider = anchor.AnchorProvider.env();
   anchor.setProvider(provider);
-
-  // Note: Program type will be derived from IDL in Anchor runtime
-  const program = (anchor.workspace as any).AegisVault;
-
-  let mint: PublicKey;
-  let admin: Keypair;
-  let guardian: Keypair;
-  let sender: Keypair;
-  let recipient: Keypair;
-  let arbiter: Keypair;
-
-  let senderTokenAccount: PublicKey;
-  let recipientTokenAccount: PublicKey;
-  let vaultConfigPda: PublicKey;
-  let vaultTokenAccountPda: PublicKey;
-  let vaultConfigBump: number;
-
-  const INITIAL_DEPOSIT = 10_000_000_000; // 10,000 tokens (decimals = 6)
-  const MAX_EPOCH_LIMIT = 5_000_000_000;  // 5,000 tokens limit per epoch
-  const EPOCH_DURATION = 86400;           // 24 hours in seconds
-
-  before(async () => {
-    admin = Keypair.generate();
-    guardian = Keypair.generate();
-    sender = Keypair.generate();
+  const program = anchor.workspace.AegisVault as anchor.Program<any>;
+  const payer = (provider.wallet as anchor.Wallet).payer;
+  const sender = Keypair.generate(),
     recipient = Keypair.generate();
-    arbiter = Keypair.generate();
+  const guardian = Keypair.generate(),
+    arbiter = Keypair.generate(),
+    stranger = Keypair.generate();
+  const bn = (n: number) => new anchor.BN(n);
+  const accounts = program.account as any;
+  let mint: PublicKey, senderToken: PublicKey, recipientToken: PublicKey;
+  type Vault = {
+    admin: Keypair;
+    mint: PublicKey;
+    config: PublicKey;
+    token: PublicKey;
+    senderToken: PublicKey;
+    recipientToken: PublicKey;
+  };
 
-    // Airdrop SOL to test actors
-    const airdropPromises = [admin, guardian, sender, recipient, arbiter].map(async (kp) => {
-      const sig = await provider.connection.requestAirdrop(kp.publicKey, 2 * anchor.web3.LAMPORTS_PER_SOL);
-      await provider.connection.confirmTransaction(sig);
-    });
-    await Promise.all(airdropPromises);
-
-    // Create Mock SPL Token Mint
+  async function fund(key: PublicKey) {
+    await provider.sendAndConfirm(
+      new anchor.web3.Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey: payer.publicKey,
+          toPubkey: key,
+          lamports: 100_000_000,
+        })
+      )
+    );
+  }
+  async function chainTime() {
+    const info = await provider.connection.getAccountInfo(
+      anchor.web3.SYSVAR_CLOCK_PUBKEY,
+      "confirmed"
+    );
+    if (!info) throw new Error("Clock sysvar unavailable");
+    return Number(info.data.readBigInt64LE(32));
+  }
+  async function waitUntil(timestamp: number) {
+    const deadline = Date.now() + 45000;
+    while ((await chainTime()) < timestamp) {
+      if (Date.now() > deadline)
+        throw new Error("Validator clock did not reach deadline");
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+  }
+  async function rejects(action: Promise<unknown>, code: string) {
+    let failure: any;
+    try {
+      await action;
+    } catch (err) {
+      failure = err;
+    }
+    expect(failure, `Expected ${code}, but transaction succeeded`).to.exist;
+    expect(failure.error?.errorCode?.code, String(failure)).to.equal(code);
+  }
+  before(async () => {
+    for (const actor of [sender, recipient, guardian, arbiter, stranger])
+      await fund(actor.publicKey);
     mint = await createMint(
       provider.connection,
-      admin,
-      admin.publicKey,
+      payer,
+      payer.publicKey,
       null,
       6
     );
-
-    // Sender ATA
-    senderTokenAccount = await createAccount(
+    senderToken = await createAccount(
       provider.connection,
-      sender,
+      payer,
       mint,
       sender.publicKey
     );
-
-    // Recipient ATA
-    recipientTokenAccount = await createAccount(
+    recipientToken = await createAccount(
       provider.connection,
-      recipient,
+      payer,
       mint,
       recipient.publicKey
     );
-
-    // Mint tokens to sender
     await mintTo(
       provider.connection,
-      admin,
+      payer,
       mint,
-      senderTokenAccount,
-      admin,
-      INITIAL_DEPOSIT
-    );
-
-    // Derive PDAs
-    [vaultConfigPda, vaultConfigBump] = PublicKey.findProgramAddressSync(
-      [Buffer.from("aegis_vault"), mint.toBuffer()],
-      program.programId
-    );
-
-    [vaultTokenAccountPda] = PublicKey.findProgramAddressSync(
-      [Buffer.from("aegis_token_vault"), mint.toBuffer()],
-      program.programId
+      senderToken,
+      payer,
+      1_000_000_000
     );
   });
-
-  it("1. Successfully initializes Aegis Vault with circuit breaker & epoch limits", async () => {
+  async function vault(
+    limit = 100,
+    duration = 3600,
+    otherMint = false
+  ): Promise<Vault> {
+    const admin = Keypair.generate();
+    await fund(admin.publicKey);
+    const m = otherMint
+      ? await createMint(provider.connection, payer, payer.publicKey, null, 6)
+      : mint;
+    const from = otherMint
+      ? await createAccount(provider.connection, payer, m, sender.publicKey)
+      : senderToken;
+    const to = otherMint
+      ? await createAccount(provider.connection, payer, m, recipient.publicKey)
+      : recipientToken;
+    if (otherMint)
+      await mintTo(provider.connection, payer, m, from, payer, 10000);
+    const [config] = PublicKey.findProgramAddressSync(
+      [Buffer.from("aegis_vault"), admin.publicKey.toBuffer(), m.toBuffer()],
+      program.programId
+    );
+    const [token] = PublicKey.findProgramAddressSync(
+      [Buffer.from("aegis_token_vault"), config.toBuffer()],
+      program.programId
+    );
     await program.methods
-      .initializeVault(
-        new anchor.BN(MAX_EPOCH_LIMIT),
-        new anchor.BN(EPOCH_DURATION)
-      )
-      .accounts({
+      .initializeVault(bn(limit), bn(duration))
+      .accountsStrict({
         admin: admin.publicKey,
         guardian: guardian.publicKey,
-        tokenMint: mint,
-        vaultConfig: vaultConfigPda,
-        vaultTokenAccount: vaultTokenAccountPda,
+        tokenMint: m,
+        vaultConfig: config,
+        vaultTokenAccount: token,
         systemProgram: SystemProgram.programId,
         tokenProgram: TOKEN_PROGRAM_ID,
         rent: anchor.web3.SYSVAR_RENT_PUBKEY,
       })
       .signers([admin])
       .rpc();
-
-    const config = await program.account.vaultConfig.fetch(vaultConfigPda);
-    expect(config.admin.toString()).to.equal(admin.publicKey.toString());
-    expect(config.guardian.toString()).to.equal(guardian.publicKey.toString());
-    expect(config.isPaused).to.be.false;
-    expect(config.maxEpochWithdrawalLimit.toNumber()).to.equal(MAX_EPOCH_LIMIT);
-  });
-
-  it("2. Creates a conditional escrow with timelock protection", async () => {
-    const escrowId = new anchor.BN(1);
-    const amount = new anchor.BN(1_000_000_000); // 1,000 tokens
-    const now = Math.floor(Date.now() / 1000);
-    const releaseTime = new anchor.BN(now + 10); // 10 seconds lock
-    const expiryTime = new anchor.BN(now + 3600); // 1 hour expiry
-
-    const [escrowPda] = PublicKey.findProgramAddressSync(
-      [Buffer.from("aegis_escrow"), sender.publicKey.toBuffer(), escrowId.toArrayLike(Buffer, "le", 8)],
+    return {
+      admin,
+      mint: m,
+      config,
+      token,
+      senderToken: from,
+      recipientToken: to,
+    };
+  }
+  function address(v: Vault, id: number) {
+    return PublicKey.findProgramAddressSync(
+      [
+        Buffer.from("aegis_escrow"),
+        v.config.toBuffer(),
+        sender.publicKey.toBuffer(),
+        bn(id).toArrayLike(Buffer, "le", 8),
+      ],
       program.programId
-    );
-
+    )[0];
+  }
+  async function create(
+    v: Vault,
+    id: number,
+    amount = 50,
+    release?: number,
+    expiry?: number,
+    mediator = arbiter.publicKey
+  ) {
+    const now = await chainTime(),
+      escrow = address(v, id);
     await program.methods
-      .createEscrow(escrowId, amount, releaseTime, expiryTime)
-      .accounts({
+      .createEscrow(
+        bn(id),
+        bn(amount),
+        bn(release ?? now - 1),
+        bn(expiry ?? now + 3600)
+      )
+      .accountsStrict({
         sender: sender.publicKey,
         recipient: recipient.publicKey,
-        arbiter: arbiter.publicKey,
-        tokenMint: mint,
-        vaultConfig: vaultConfigPda,
-        senderTokenAccount: senderTokenAccount,
-        vaultTokenAccount: vaultTokenAccountPda,
-        escrowAccount: escrowPda,
+        arbiter: mediator,
+        tokenMint: v.mint,
+        vaultConfig: v.config,
+        senderTokenAccount: v.senderToken,
+        vaultTokenAccount: v.token,
+        escrowAccount: escrow,
         systemProgram: SystemProgram.programId,
         tokenProgram: TOKEN_PROGRAM_ID,
       })
       .signers([sender])
       .rpc();
-
-    const escrowData = await program.account.escrowAccount.fetch(escrowPda);
-    expect(escrowData.amount.toNumber()).to.equal(amount.toNumber());
-    expect(escrowData.isReleased).to.be.false;
-
-    const vaultBal = await getAccount(provider.connection, vaultTokenAccountPda);
-    expect(Number(vaultBal.amount)).to.equal(amount.toNumber());
-  });
-
-  it("3. Security Invariant: Rejects release when timelock has not yet elapsed", async () => {
-    const escrowId = new anchor.BN(1);
-    const [escrowPda] = PublicKey.findProgramAddressSync(
-      [Buffer.from("aegis_escrow"), sender.publicKey.toBuffer(), escrowId.toArrayLike(Buffer, "le", 8)],
-      program.programId
-    );
-
-    try {
-      await program.methods
-        .releaseEscrow()
-        .accounts({
-          caller: recipient.publicKey,
-          recipientTokenAccount: recipientTokenAccount,
-          tokenMint: mint,
-          vaultConfig: vaultConfigPda,
-          vaultTokenAccount: vaultTokenAccountPda,
-          escrowAccount: escrowPda,
-          tokenProgram: TOKEN_PROGRAM_ID,
-        })
-        .signers([recipient])
-        .rpc();
-      expect.fail("Should have failed with TimelockNotElapsed");
-    } catch (err: any) {
-      expect(err.toString()).to.include("TimelockNotElapsed");
-    }
-  });
-
-  it("4. Circuit Breaker: Guardian can pause vault during detected anomalies", async () => {
-    await program.methods
-      .emergencyPause()
-      .accounts({
-        authority: guardian.publicKey,
-        tokenMint: mint,
-        vaultConfig: vaultConfigPda,
-      })
-      .signers([guardian])
-      .rpc();
-
-    const config = await program.account.vaultConfig.fetch(vaultConfigPda);
-    expect(config.isPaused).to.be.true;
-  });
-
-  it("5. Security Invariant: All fund movements blocked while Vault is paused", async () => {
-    const escrowId = new anchor.BN(1);
-    const [escrowPda] = PublicKey.findProgramAddressSync(
-      [Buffer.from("aegis_escrow"), sender.publicKey.toBuffer(), escrowId.toArrayLike(Buffer, "le", 8)],
-      program.programId
-    );
-
-    try {
-      await program.methods
-        .releaseEscrow()
-        .accounts({
-          caller: arbiter.publicKey,
-          recipientTokenAccount: recipientTokenAccount,
-          tokenMint: mint,
-          vaultConfig: vaultConfigPda,
-          vaultTokenAccount: vaultTokenAccountPda,
-          escrowAccount: escrowPda,
-          tokenProgram: TOKEN_PROGRAM_ID,
-        })
-        .signers([arbiter])
-        .rpc();
-      expect.fail("Should have failed with VaultPaused");
-    } catch (err: any) {
-      expect(err.toString()).to.include("VaultPaused");
-    }
-  });
-
-  it("6. Admin unpauses and releases escrow after timelock matures", async () => {
-    // Admin unpauses
-    await program.methods
-      .emergencyUnpause()
-      .accounts({
-        authority: admin.publicKey,
-        tokenMint: mint,
-        vaultConfig: vaultConfigPda,
-      })
-      .signers([admin])
-      .rpc();
-
-    // Wait for timelock (10s) to pass
-    await new Promise((resolve) => setTimeout(resolve, 11000));
-
-    const escrowId = new anchor.BN(1);
-    const [escrowPda] = PublicKey.findProgramAddressSync(
-      [Buffer.from("aegis_escrow"), sender.publicKey.toBuffer(), escrowId.toArrayLike(Buffer, "le", 8)],
-      program.programId
-    );
-
-    await program.methods
+    return escrow;
+  }
+  function release(
+    v: Vault,
+    e: PublicKey,
+    caller = recipient,
+    destination = v.recipientToken
+  ) {
+    return program.methods
       .releaseEscrow()
-      .accounts({
-        caller: recipient.publicKey,
-        recipientTokenAccount: recipientTokenAccount,
-        tokenMint: mint,
-        vaultConfig: vaultConfigPda,
-        vaultTokenAccount: vaultTokenAccountPda,
-        escrowAccount: escrowPda,
+      .accountsStrict({
+        caller: caller.publicKey,
+        recipientTokenAccount: destination,
+        tokenMint: v.mint,
+        vaultConfig: v.config,
+        vaultTokenAccount: v.token,
+        escrowAccount: e,
         tokenProgram: TOKEN_PROGRAM_ID,
       })
-      .signers([recipient])
+      .signers([caller])
       .rpc();
-
-    const recipientBal = await getAccount(provider.connection, recipientTokenAccount);
-    expect(Number(recipientBal.amount)).to.equal(1_000_000_000);
+  }
+  function refund(v: Vault, e: PublicKey, caller = recipient) {
+    return program.methods
+      .cancelEscrow()
+      .accountsStrict({
+        caller: caller.publicKey,
+        senderTokenAccount: v.senderToken,
+        tokenMint: v.mint,
+        vaultConfig: v.config,
+        vaultTokenAccount: v.token,
+        escrowAccount: e,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .signers([caller])
+      .rpc();
+  }
+  function pause(v: Vault, caller = guardian, resume = false) {
+    return (
+      resume
+        ? program.methods.emergencyUnpause()
+        : program.methods.emergencyPause()
+    )
+      .accountsStrict({
+        authority: caller.publicKey,
+        tokenMint: v.mint,
+        vaultConfig: v.config,
+      })
+      .signers([caller])
+      .rpc();
+  }
+  function update(
+    v: Vault,
+    limit: number | null,
+    duration: number | null = null,
+    caller = v.admin
+  ) {
+    return program.methods
+      .updateVaultParams(
+        null,
+        limit === null ? null : bn(limit),
+        duration === null ? null : bn(duration)
+      )
+      .accountsStrict({
+        admin: caller.publicKey,
+        tokenMint: v.mint,
+        vaultConfig: v.config,
+      })
+      .signers([caller])
+      .rpc();
+  }
+  async function snapshot(v: Vault, e: PublicKey) {
+    const c = await accounts.vaultConfig.fetch(v.config),
+      s = await accounts.escrowAccount.fetch(e);
+    return {
+      balance: (
+        await getAccount(provider.connection, v.token)
+      ).amount.toString(),
+      liability: c.totalActiveEscrowAmount.toString(),
+      spent: c.currentEpochWithdrawn.toString(),
+      start: c.currentEpochStart.toString(),
+      released: s.isReleased,
+      cancelled: s.isCancelled,
+    };
+  }
+  it("isolates admins using the same mint and binds escrow to its vault", async () => {
+    const a = await vault(),
+      b = await vault(),
+      ea = await create(a, 1),
+      eb = await create(b, 1);
+    expect(a.config.equals(b.config)).to.equal(false);
+    expect(ea.equals(eb)).to.equal(false);
+    expect(
+      (await accounts.escrowAccount.fetch(ea)).vaultConfig.equals(a.config)
+    ).to.equal(true);
+    expect((await snapshot(a, ea)).liability).to.equal("50");
+  });
+  for (const otherMint of [false, true]) {
+    it(`rejects release AND refund against a funded ${
+      otherMint ? "different-mint" : "same-mint"
+    } vault`, async () => {
+      const a = await vault(),
+        b = await vault(100, 3600, otherMint);
+      const ea = await create(a, 1),
+        eb = await create(b, 1);
+      const beforeA = await snapshot(a, ea),
+        beforeB = await snapshot(b, eb);
+      await rejects(release(b, ea), "InvalidVault");
+      await rejects(refund(b, ea), "InvalidVault");
+      expect(await snapshot(a, ea)).to.deep.equal(beforeA);
+      expect(await snapshot(b, eb)).to.deep.equal(beforeB);
+    });
+  }
+  it("enforces recipient timelock, then releases with conserved balances", async () => {
+    const v = await vault(),
+      now = await chainTime(),
+      e = await create(v, 1, 50, now + 8);
+    const before = await snapshot(v, e);
+    await rejects(release(v, e), "TimelockNotElapsed");
+    expect(await snapshot(v, e)).to.deep.equal(before);
+    const bal = (await getAccount(provider.connection, v.recipientToken))
+      .amount;
+    await waitUntil(now + 8);
+    await release(v, e);
+    expect(
+      (await getAccount(provider.connection, v.recipientToken)).amount - bal
+    ).to.equal(BigInt(50));
+    expect(await snapshot(v, e)).to.include({
+      balance: "0",
+      liability: "0",
+      spent: "50",
+      released: true,
+    });
+  });
+  it("permits explicitly trusted sender and arbiter early release", async () => {
+    const v = await vault(),
+      now = await chainTime();
+    await release(v, await create(v, 1, 50, now + 600), sender);
+    await release(v, await create(v, 2, 50, now + 600), arbiter);
+  });
+  it("rejects strangers, wrong destination owners and guardian settlement", async () => {
+    const v = await vault(),
+      e = await create(v, 1),
+      before = await snapshot(v, e);
+    for (const caller of [stranger, guardian]) {
+      await rejects(release(v, e, caller), "UnauthorizedSigner");
+      await rejects(refund(v, e, caller), "UnauthorizedSigner");
+    }
+    await rejects(
+      release(v, e, recipient, v.senderToken),
+      "UnauthorizedSigner"
+    );
+    expect(await snapshot(v, e)).to.deep.equal(before);
+  });
+  it("rejects destination with wrong mint", async () => {
+    const v = await vault(),
+      b = await vault(100, 3600, true),
+      e = await create(v, 1);
+    await rejects(release(v, e, recipient, b.recipientToken), "InvalidMint");
+  });
+  for (const cancelFirst of [false, true]) {
+    it(`rejects both settlement paths after ${
+      cancelFirst ? "refund" : "release"
+    }`, async () => {
+      const v = await vault(),
+        e = await create(v, 1);
+      await (cancelFirst ? refund(v, e) : release(v, e));
+      const before = await snapshot(v, e);
+      await rejects(release(v, e), "EscrowAlreadySettled");
+      await rejects(refund(v, e), "EscrowAlreadySettled");
+      expect(await snapshot(v, e)).to.deep.equal(before);
+    });
+  }
+  for (const refundFirst of [false, true]) {
+    it(`shares outflow budget: ${
+      refundFirst ? "refund then release" : "release then refund"
+    }`, async () => {
+      const v = await vault(),
+        a = await create(v, 1, 60),
+        b = await create(v, 2, 50);
+      await (refundFirst ? refund(v, a) : release(v, a));
+      const before = await snapshot(v, b);
+      await rejects(
+        refundFirst ? release(v, b) : refund(v, b),
+        "RateLimitExceeded"
+      );
+      expect(await snapshot(v, b)).to.deep.equal(before);
+    });
+  }
+  it("rejects oversized deposit before transferring tokens", async () => {
+    const v = await vault(),
+      balance = (await getAccount(provider.connection, v.senderToken)).amount;
+    await rejects(create(v, 1, 101), "EscrowExceedsLimit");
+    expect(await provider.connection.getAccountInfo(address(v, 1))).to.equal(
+      null
+    );
+    expect(
+      (await getAccount(provider.connection, v.senderToken)).amount
+    ).to.equal(balance);
+  });
+  it("rejects zero deposits and invalid or expired deadlines", async () => {
+    const v = await vault(),
+      now = await chainTime();
+    await rejects(create(v, 1, 0), "ZeroAmountInvalid");
+    await rejects(
+      create(v, 1, 50, now + 10, now + 10),
+      "InvalidTimelockConfiguration"
+    );
+    await rejects(create(v, 1, 50, now - 10, now - 1), "EscrowExpired");
+  });
+  it("protects outstanding escrow sizes against admin limit reductions", async () => {
+    const v = await vault(),
+      e = await create(v, 1, 100);
+    await rejects(update(v, 99), "ActiveEscrowsPreventLimitDecrease");
+    await release(v, e);
+    await update(v, 50);
+    expect(
+      (
+        await accounts.vaultConfig.fetch(v.config)
+      ).maxEpochWithdrawalLimit.toString()
+    ).to.equal("50");
+  });
+  it("does not reset consumed budget when admin changes parameters", async () => {
+    const v = await vault(),
+      e = await create(v, 1, 80);
+    await release(v, e);
+    await update(v, 120, 7200);
+    const b = await create(v, 2, 50);
+    await rejects(release(v, b), "RateLimitExceeded");
+    expect((await snapshot(v, b)).spent).to.equal("80");
+  });
+  it("guardian cannot unpause or change parameters; strangers cannot pause", async () => {
+    const v = await vault();
+    await rejects(pause(v, stranger), "UnauthorizedSigner");
+    await pause(v);
+    await rejects(pause(v, guardian, true), "UnauthorizedSigner");
+    await rejects(update(v, 200, null, guardian), "UnauthorizedSigner");
+    await pause(v, v.admin, true);
+    expect((await accounts.vaultConfig.fetch(v.config)).isPaused).to.equal(
+      false
+    );
+  });
+  it("pause blocks deposits, releases and refunds without changing balances", async () => {
+    const v = await vault(),
+      e = await create(v, 1),
+      before = await snapshot(v, e);
+    await pause(v);
+    await rejects(create(v, 2), "VaultPaused");
+    await rejects(release(v, e), "VaultPaused");
+    await rejects(refund(v, e), "VaultPaused");
+    expect(await snapshot(v, e)).to.deep.equal(before);
+    await pause(v, v.admin, true);
+    await release(v, e);
+  });
+  it("sender waits for expiry to refund; expired escrow cannot release", async () => {
+    const v = await vault(),
+      now = await chainTime(),
+      e = await create(v, 1, 50, now - 1, now + 8, SystemProgram.programId);
+    await rejects(refund(v, e, sender), "EscrowNotExpiredYet");
+    await waitUntil(now + 8);
+    await rejects(release(v, e, sender), "EscrowExpired");
+    await refund(v, e, sender);
+    expect(await snapshot(v, e)).to.include({
+      liability: "0",
+      balance: "0",
+      cancelled: true,
+    });
+  });
+  it("arbiter refunds early, with funds always returned to sender", async () => {
+    const v = await vault(),
+      e = await create(v, 1),
+      before = (await getAccount(provider.connection, v.senderToken)).amount;
+    await refund(v, e, arbiter);
+    expect(
+      (await getAccount(provider.connection, v.senderToken)).amount - before
+    ).to.equal(BigInt(50));
+  });
+  it("demo: budget rejection, guardian pause, admin recovery, next-window settlement", async () => {
+    const v = await vault(),
+      a = await create(v, 1, 60),
+      b = await create(v, 2, 50);
+    await release(v, a);
+    await rejects(release(v, b), "RateLimitExceeded");
+    await pause(v);
+    await rejects(refund(v, b), "VaultPaused");
+    await pause(v, v.admin, true);
+    const c = await accounts.vaultConfig.fetch(v.config),
+      boundary = (await chainTime()) + 4;
+    await update(v, null, boundary - c.currentEpochStart.toNumber());
+    await waitUntil(boundary);
+    await refund(v, b);
+    expect(await snapshot(v, b)).to.include({
+      liability: "0",
+      balance: "0",
+      spent: "50",
+      cancelled: true,
+    });
   });
 });

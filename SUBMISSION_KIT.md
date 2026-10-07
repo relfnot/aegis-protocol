@@ -1,92 +1,57 @@
-# 📋 Aegis Protocol — Complete Submission Kit
-### For Colosseum Crypto World's Fair & Adevar Labs Security Pre-Audit ($4,000 Grant)
+# Application draft: Aegis Protocol
 
-Dokumen ini berisi seluruh materi dan jawaban siap pakai untuk mendaftarkan proyek ini ke:
-1. **Colosseum Crypto World's Fair Hackathon**
-2. **Superteam Earn Bounty (Adevar Labs Security Sidetrack)**
-3. **Akun X (Twitter) Requirement Post**
+This is a preparation document. Actual form questions and current bounty availability have not been verified. It does not assert that an application, tweet, follow, or hackathon submission has occurred.
 
----
+## Project name and tagline
 
-## 1. 🐦 Tweet Submission Template (Wajib Sesuai Aturan)
+Aegis Protocol — Escrow payments for Solana teams with shared outflow limits and guardian emergency pause.
 
-Sebelum mengisi formulir Superteam Earn:
-1. Follow akun [@AdevarLabs](https://x.com/AdevarLabs) di X.
-2. Post tweet berikut (ganti link GitHub/Colosseum Anda):
+## Project overview
 
-```text
-Just submitted our project to the @AdevarLabs Security Sidetrack on @superteamearn for @Colosseum’s Crypto World’s Fair Hackathon
+Aegis is an unaudited Rust/Anchor prototype for teams paying contributors and service providers through scheduled escrow tranches. Each escrow is bound to one independently administered vault. Payments and refunds consume a shared reset-window budget, while a guardian can pause deposits and settlements. The admin controls recovery and configuration. Senders or designated arbiters can authorize early payment, and the recipient or arbiter can authorize a refund. These permissions are explicit trust assumptions, not automatic dispute adjudication.
 
-Excited for the chance to receive a full security Pre-Audit for our project.
+## Architecture and technical readiness
 
-https://github.com/YOUR_GITHUB_USERNAME/aegis-protocol
-```
-3. Salin tautan Tweet yang sudah diposting untuk dimasukkan ke form pendaftaran.
+The implementation separates initialization, deposit, release, refund and emergency controls. Vault addresses include admin and mint, and escrow addresses include the vault, sender and escrow ID. Settlement validates the stored vault relationship and token accounts. Both outflow paths share checked budget accounting and reserve-versus-liability checks. Oversized escrows are rejected; administrators cannot reduce the cap while active liabilities remain.
 
----
+The repository includes Rust boundary tests and transaction-level regression tests for cross-vault substitution, access control, settlement replay, deadlines, pause and shared outflow accounting. Report only the observed results recorded in VALIDATION.md, together with the commit reviewed. These tests are not a substitute for independent audit.
 
-## 2. 📝 Formulir Pendaftaran Superteam Earn (Pertanyaan & Jawaban Siap Pakai)
+## Why a pre-audit is useful now
 
-### Q1: Project Name
-**Jawaban:**
-`Aegis Protocol`
+The core custody and settlement paths are implemented, with a narrow review scope. We want independent scrutiny before a public beta, especially for account substitution, authority overlap, refund/payment budget interactions, time boundaries, failed transaction rollback and operational recovery. A pre-audit would help validate these design decisions and guide remediation before exposing users to real deposits.
 
-### Q2: Short Tagline (Satu Kalimat)
-**Jawaban:**
-`Security-first programmatic escrow, invariant tripwires, and circuit breaker infrastructure on Solana.`
+## Ecosystem impact
 
-### Q3: Project Description / Overview (Ringkasan Proyek)
-**Jawaban:**
-> Aegis Protocol is an on-chain security layer designed to prevent catastrophic protocol drains on Solana. It introduces programmatic circuit breakers, epoch-based withdrawal rate limiting, and conditional timelocked escrows directly into smart contract architectures. While Solana enables lightning-fast execution, exploits can drain protocol vaults in a single transaction slot. Aegis solves this by decoupling guardian emergency pauses from admin controls, enforcing hard sliding-window flow caps, and providing verifiable mathematical invariants across all fund movements.
+The initial intended users are Solana teams making contributor or service-provider payments. Aegis aims to provide reusable escrow controls with explicit permissions and bounded outflows. Adoption, customer demand and integrations are not yet established; a pilot with one team is the next product-validation milestone.
 
-### Q4: Colosseum Hackathon Submission Link
-**Jawaban:**
-`https://arena.colosseum.org/projects/aegis-protocol` *(Ganti dengan link project submission Anda di Colosseum Arena)*
+## Launch plan
 
-### Q5: GitHub Repository Link (Must contain Solana/Rust code)
-**Jawaban:**
-`https://github.com/YOUR_GITHUB_USERNAME/aegis-protocol` *(Pastikan repositori diset Public dan berisi kode yang telah dibuat di folder ini)*
+1. Reproduce local build, security regressions and demo at a recorded commit.
+2. Obtain independent pre-audit, fix findings, and complete the included verification review.
+3. Configure operational authorities and a private security contact; publish a devnet deployment and explorer evidence.
+4. Run a small user pilot and assess whether production deployment is justified.
 
-### Q6: Codebase Architecture & Technical Complexity (Mengapa kode ini layak diaudit?)
-**Jawaban:**
-> Our codebase is built using Anchor 0.30.1 and native Rust, structured modularly into dedicated instruction handlers, deterministic PDA state management, and an exhaustive domain error enum (`AegisError`). Key technical components include:
-> 1. **Sliding-Window Epoch Rate Limiter**: Cryptographically tracks withdrawal flows across configurable time epochs to throttle systemic drains.
-> 2. **Multi-Role Privilege Separation**: Guardian keys (designed for automated surveillance bots or multisigs) can instantly trigger `emergency_pause()`, while only the primary admin authority can resume or reconfigure protocol parameters.
-> 3. **Timelock & Arbitration State Machine**: Conditional release, refund timeouts, and optional third-party dispute settlement logic.
-> 4. **Strict Anchor PDA Derivation**: Canonical bump verification and checked arithmetic on all vault liability calculations to prevent account spoofing and arithmetic overflow.
+No fixed mainnet date, audit result, certification, or guaranteed exploit prevention is claimed.
 
-### Q7: What are the main security concerns and attack surfaces you want Adevar Labs to prioritize? (Krusial: Menunjukkan kedewasaan teknis)
-**Jawaban:**
-> We have documented our formal security invariants in `SECURITY.md` within the repository. We specifically request the SEAL-Certified engineers at Adevar Labs to focus on:
-> 1. **Epoch Boundary Rollover Logic**: Potential edge-case race conditions during epoch transitions under high transaction load.
-> 2. **Cross-Program Invocation (CPI) Signer Seeds**: Verifying the security and bump canonicalization during vault PDA token transfers to eliminate spoofing vectors.
-> 3. **Token-2022 Compatibility**: Ensuring our invariant tracking remains airtight when handling newer Token-2022 extensions (such as transfer hooks or fee-on-transfer tokens).
+## Owner-supplied evidence needed before submitting
 
-### Q8: Launch Roadmap & Ecosystem Impact (Kesiapan Launch)
-**Jawaban:**
-> - **Current Phase (Hackathon)**: Core Anchor contracts developed, 100% passing TypeScript integration tests covering happy paths and exploit scenarios.
-> - **Month 1 (Pre-Audit & Refinement)**: Undergo Adevar Labs Pre-Audit, remediate identified findings, and implement formal verification assertions.
-> - **Month 2 (Public Devnet Beta)**: Launch testnet SDK for Solana DeFi protocols and autonomous agent developers.
-> - **Month 3 (Mainnet Deployment)**: Mainnet deployment with initial TVL caps protected by Aegis rate-limiters. Receiving this Pre-Audit now directly unlocks our launch timeline and secures user assets before mainnet launch.
+- Real public repository URL and reviewed commit hash.
+- Actual Colosseum Crypto World's Fair submission link and eligibility confirmation.
+- Team identities, relevant experience and pilot/user evidence where available.
+- Demo recording and, if deployed, verified devnet program/explorer links.
+- Current bounty form, availability and deadline confirmation.
+- Working private security contact.
 
----
+## Tweet template — use only after actually applying
 
-## 3. 🏛️ Colosseum Crypto World's Fair Submission Pitch
+Just submitted Aegis Protocol to the @AdevarLabs Security Sidetrack on @superteamearn for @Colosseum's Crypto World's Fair Hackathon.
 
-Saat submit proyek di platform Colosseum:
+Excited for a security Pre-Audit of our Solana escrow and shared outflow limits.
 
-* **Category/Track**: Infrastructure / Security & Tooling / DeFi
-* **Elevator Pitch**: Automated on-chain circuit breakers and conditional rate-limited escrow infrastructure on Solana.
-* **Problem**: Solana protocols lack native, standardized tripwires and circuit breakers. When an exploit or oracle glitch happens, millions in TVL can vanish before a human team can assemble a multisig quorum.
-* **Solution**: Aegis gives protocols autonomous defenses: sliding-window rate limiters, instant guardian pauses, and mathematically provable solvency invariants at the smart contract layer.
-* **Tech Stack**: Solana, Rust, Anchor Framework, TypeScript, SPL-Token.
+[PROJECT_LINK]
 
----
+Replace the link, verify the final post length, follow @AdevarLabs, and retain the published tweet URL. Posting and following have not been performed by this work.
 
-## 4. 🚀 Langkah Eksekusi Selanjutnya (Checklist Anda)
+## Reward description
 
-1. [ ] Buat repository baru di akun GitHub Anda (misal `https://github.com/username/aegis-protocol`).
-2. [ ] Push folder `C:\Users\Administrator\.gemini\antigravity-ide\scratch\aegis-protocol` ke repository GitHub Anda.
-3. [ ] Submit proyek ke **Colosseum Crypto World's Fair** menggunakan deskripsi di atas.
-4. [ ] Tweet link repository & mention `@AdevarLabs` sesuai format.
-5. [ ] Buka halaman bounty di **Superteam Earn** dan copy-paste jawaban dari file ini.
+According to the supplied bounty text: five selected teams receive a pre-audit service valued at $4,000 each, with one follow-up fix verification. This is an in-kind service, not a cash grant. Verify the live terms before applying.
